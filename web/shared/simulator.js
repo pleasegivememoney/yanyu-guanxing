@@ -4392,6 +4392,7 @@ async function runEquipAutoSimulation() {
                     return true;
                 },
                 makePreview: (request, count) => wasmMakePreview(request, count),
+                xilianOnce: (equip) => wasmXilianOnce(equip),
                 xilianPlan: (equip, accepts) => wasmXilianPlan(equip, accepts),
             },
             shouldCancel: () => equipAutoCancelRequested || runToken !== equipAutoRunToken,

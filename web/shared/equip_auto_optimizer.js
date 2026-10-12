@@ -245,87 +245,6 @@
         };
     }
 
-    function refinementPreviewItems(bridge, equip, count) {
-        const response = bridge.xilianPlan(toWasmEquip(equip), Array(count).fill(false));
-        if (response && response.error && !(response.items || []).length) throw new Error(response.error);
-        return (response && response.items || []).slice(0, count);
-    }
-
-    function collectSlotMaxima(items, targetProp) {
-        const maxima = { 1: null, 2: null, 3: null };
-        items.forEach((item, zeroIndex) => {
-            const slot = finiteNumber(item && item.slot);
-            const prop = item && item.prop;
-            if (slot < 1 || slot > 3 || !prop || prop.prop !== targetProp) return;
-            const value = finiteNumber(prop.value, Number.NEGATIVE_INFINITY);
-            if (!Number.isFinite(value)) return;
-            const occurrence = { index: finiteNumber(item.index, zeroIndex + 1), slot, value };
-            if (!maxima[slot] || value > maxima[slot].value) {
-                maxima[slot] = { slot, value, occurrences: [occurrence] };
-            } else if (value === maxima[slot].value) {
-                maxima[slot].occurrences.push(occurrence);
-            }
-        });
-        return maxima;
-    }
-
-    function initialSlotMaxima(equip, targetProp) {
-        const maxima = { 1: null, 2: null, 3: null };
-        (Array.isArray(equip && equip.exts) ? equip.exts : []).slice(0, 3).forEach((prop, index) => {
-            const property = prop && (prop.prop || prop.Key || prop.key);
-            if (property !== targetProp) return;
-            const value = finiteNumber(prop && (prop.value != null ? prop.value : prop.Value), Number.NEGATIVE_INFINITY);
-            if (!Number.isFinite(value)) return;
-            const slot = index + 1;
-            const occurrence = { index: 0, slot, value, source: 'original' };
-            maxima[slot] = { slot, value, occurrences: [occurrence], source: 'original' };
-        });
-        return maxima;
-    }
-
-    function cartesianOccurrenceChoices(groups, visit, depth = 0, selected = []) {
-        if (depth >= groups.length) {
-            visit(selected.slice());
-            return;
-        }
-        groups[depth].forEach(item => {
-            selected.push(item);
-            cartesianOccurrenceChoices(groups, visit, depth + 1, selected);
-            selected.pop();
-        });
-    }
-
-    function multiplierWorkUntil(indices) {
-        const sorted = indices.slice().sort((a, b) => a - b);
-        let previous = 0;
-        let accepted = 0;
-        let work = 0;
-        sorted.forEach(index => {
-            work += (index - previous) * [1, 2, 4, 8][Math.min(accepted, 3)];
-            previous = index;
-            accepted += 1;
-        });
-        return { multiplierWork: work, cutoff: sorted[sorted.length - 1] || 0, sorted };
-    }
-
-    function selectCheapestMaxima(maxima) {
-        const groups = [1, 2, 3].map(slot => maxima[slot]).filter(Boolean).map(item => item.occurrences);
-        if (!groups.length) return null;
-        let best = null;
-        cartesianOccurrenceChoices(groups, choice => {
-            const work = multiplierWorkUntil(choice.map(item => item.index));
-            const signature = work.sorted.join(',');
-            const candidate = { ...work, occurrences: choice.slice(), signature };
-            if (!best
-                || candidate.multiplierWork < best.multiplierWork
-                || (candidate.multiplierWork === best.multiplierWork && candidate.cutoff < best.cutoff)
-                || (candidate.multiplierWork === best.multiplierWork && candidate.cutoff === best.cutoff && candidate.signature < best.signature)) {
-                best = candidate;
-            }
-        });
-        return best;
-    }
-
     function refinementCost(equip, planItems, cutoff, data) {
         if (!cutoff) return { mainMaterial: null, mainAmount: 0, lianjin: 0, silver: 0, multiplierWork: 0 };
         const isArmor = finiteNumber(equip.typ) >= 5 && finiteNumber(equip.typ) <= 7;
@@ -343,82 +262,257 @@
         };
     }
 
-    function nextStatefulMaximum(items, targetProp, settledSlots, currentMaxima) {
-        const maxima = collectSlotMaxima(items, targetProp);
-        const choices = [1, 2, 3]
-            .filter(slot => !settledSlots.has(slot) && maxima[slot]
-                && (!currentMaxima[slot] || maxima[slot].value > currentMaxima[slot].value))
-            .flatMap(slot => maxima[slot].occurrences);
-        choices.sort((a, b) => a.index - b.index || a.slot - b.slot);
-        return choices[0] || null;
+    function xilianMarkMask(marks) {
+        let mask = 0;
+        for (const raw of marks || []) {
+            const slot = Number(raw);
+            if (slot >= 1 && slot <= 3) mask |= 1 << (slot - 1);
+        }
+        return mask;
     }
 
-    function analyzeRefinement(bridge, equip, targetProp, count, data) {
-        const maxima = initialSlotMaxima(equip, targetProp);
-        const settledSlots = new Set((equip.xilian_marks || []).map(Number));
-        const accepted = [];
-        const plannedItems = [];
-        let currentEquip = clone(equip);
-        let remaining = count;
-        let consumed = 0;
+    function xilianMaskMult(mask) {
+        const count = ((mask & 1) ? 1 : 0) + ((mask & 2) ? 1 : 0) + ((mask & 4) ? 1 : 0);
+        return [1, 2, 4, 8][Math.min(3, count)];
+    }
 
-        while (remaining > 0 && settledSlots.size < 3) {
-            const previewItems = refinementPreviewItems(bridge, currentEquip, remaining);
-            const next = nextStatefulMaximum(previewItems, targetProp, settledSlots, maxima);
-            if (!next) break;
+    function slotTargetValue(prop, targetProp) {
+        if (!prop) return 0;
+        const property = prop.prop || prop.Key || prop.key;
+        if (property !== targetProp) return 0;
+        const value = Number(prop.value != null ? prop.value : prop.Value);
+        return Number.isFinite(value) ? value : 0;
+    }
 
-            const localCutoff = next.index;
-            const flags = Array(localCutoff).fill(false);
-            flags[localCutoff - 1] = true;
-            const planned = bridge.xilianPlan(toWasmEquip(currentEquip), flags);
-            if (planned && planned.error && !(planned.items || []).length) throw new Error(planned.error);
-            const segment = (planned && planned.items || []).slice(0, localCutoff);
-            const acceptedItem = segment[localCutoff - 1];
-            const actualSlot = finiteNumber(acceptedItem && acceptedItem.slot);
-            const actualProp = acceptedItem && acceptedItem.prop;
-            if (!acceptedItem || !acceptedItem.accepted || actualSlot !== next.slot
-                || !actualProp || actualProp.prop !== targetProp) {
-                throw new Error('精炼状态回放与预览不一致，请缩小范围后重试');
-            }
-
-            segment.forEach((item, index) => {
-                plannedItems.push({
-                    ...item,
-                    index: consumed + finiteNumber(item && item.index, index + 1),
-                });
-            });
-            const occurrence = {
-                index: consumed + finiteNumber(acceptedItem.index, localCutoff),
-                slot: actualSlot,
-                value: finiteNumber(actualProp.value),
+    /**
+     * 预生成某件装备的精炼序列上下文（与手动 buildXilianMaxPlan 同源）。
+     * 逐次不锁定推进 CZSeed 得到自然序列 seedBefore，并按 (步, 当前精炼等级)
+     * 惰性缓存真实掷值 offerAt——锁定会抬高消耗倍率、进而改变后续掷值，
+     * 因此必须在「锁定时机」维度精确展开，而不是贪心取窗口最大值。
+     * 上下文按件复用（各目标属性共享同一序列）。
+     */
+    function buildRefinementContext(bridge, equip, count) {
+        if (!bridge || typeof bridge.xilianOnce !== 'function') {
+            throw new TypeError('桥接接口缺少 xilianOnce，无法进行精确精炼最高计算');
+        }
+        const validCount = integerInRange(count, 1, 5000, 1);
+        const slotCount = Math.min(3, Math.max(1, (equip.exts || []).length || 1));
+        const baseWasm = toWasmEquip(equip);
+        const initialXl = Number(equip.XLLevel) || 0;
+        const seedBefore = [];
+        let seedProbe = clone(baseWasm);
+        for (let step = 1; step <= validCount; step += 1) {
+            seedBefore.push(seedProbe.CZSeed);
+            const once = bridge.xilianOnce(seedProbe);
+            if (!once || once.error || !once.equip) throw new Error((once && once.error) || '无法生成精炼序列');
+            seedProbe = once.equip;
+        }
+        const offerCache = new Map();
+        function offerAt(step, effectiveLevel) {
+            const level = Math.min(100, effectiveLevel);
+            const key = `${step}|${level}`;
+            if (offerCache.has(key)) return offerCache.get(key);
+            const probe = {
+                ...baseWasm,
+                CZSeed: seedBefore[step - 1],
+                XLLevel: level,
+                XLNumber: (Number(equip.XLNumber) || 0) + step - 1,
+                xilian_marks: [],
+                xilian_accepted: 0,
             };
-            maxima[actualSlot] = { slot: actualSlot, value: occurrence.value, occurrences: [occurrence] };
-            accepted.push({ ...occurrence, prop: targetProp });
-            settledSlots.add(actualSlot);
-            consumed += localCutoff;
-            remaining -= localCutoff;
+            const once = bridge.xilianOnce(probe);
+            if (!once || once.error || !once.result) throw new Error((once && once.error) || `无法计算第 ${step} 次精炼结果`);
+            offerCache.set(key, once.result);
+            return once.result;
+        }
+        return {
+            count: validCount,
+            slotCount,
+            initialXl,
+            initialMask: xilianMarkMask(equip.xilian_marks || []),
+            initialExts: (equip.exts || []).slice(0, slotCount),
+            offerAt,
+        };
+    }
 
-            if (remaining > 0) {
-                if (!planned.equip) throw new Error('精炼状态回放缺少接受后的装备状态');
-                currentEquip = clone(planned.equip);
+    /**
+     * 精确搜索目标属性在最终三槽中的合计最大值。
+     * 枚举最终新增标记的槽位集合，在每个分支中按真实消耗倍率推进精炼等级、
+     * 保留目标属性新高；再用动态规划把达到最大值的保留路径压到最省。
+     */
+    function computeExactRefinementPlan(context, targetProp) {
+        const { count, slotCount, initialXl, initialMask, offerAt } = context;
+        const initialValues = context.initialExts.map(prop => slotTargetValue(prop, targetProp));
+        const allMask = (1 << slotCount) - 1;
+        const compareMeta = (a, b) => {
+            if (a.cutoffLianjin !== b.cutoffLianjin) return a.cutoffLianjin - b.cutoffLianjin;
+            if (a.lastStep !== b.lastStep) return a.lastStep - b.lastStep;
+            return a.keepCount - b.keepCount;
+        };
+        const sumValues = values => values.reduce((sum, value) => sum + value, 0);
+
+        const candidates = [];
+        for (let addedMask = 0; addedMask <= allMask; addedMask += 1) {
+            if (addedMask & initialMask) continue;
+            const enabledMask = initialMask | addedMask;
+            let mask = initialMask;
+            let xlLevel = initialXl;
+            const values = initialValues.slice();
+            const firstSteps = Array(slotCount).fill(0);
+            const bestSteps = Array(slotCount).fill(0);
+            const xlAfter = Array(count + 1).fill(initialXl);
+            for (let step = 1; step <= count; step += 1) {
+                const offer = offerAt(step, xlLevel);
+                xlLevel += xilianMaskMult(mask);
+                xlAfter[step] = xlLevel;
+                const slotIndex = Number(offer && offer.slot) - 1;
+                if (slotIndex < 0 || slotIndex >= slotCount || !(enabledMask & (1 << slotIndex))) continue;
+                const offerValue = slotTargetValue(offer && offer.prop, targetProp);
+                if (!(mask & (1 << slotIndex))) {
+                    mask |= 1 << slotIndex;
+                    firstSteps[slotIndex] = step;
+                    values[slotIndex] = offerValue;
+                    if (offerValue > 0) bestSteps[slotIndex] = step;
+                } else if (offerValue > values[slotIndex]) {
+                    values[slotIndex] = offerValue;
+                    bestSteps[slotIndex] = step;
+                }
             }
+            const stepSet = new Set([...firstSteps, ...bestSteps].filter(Boolean));
+            const steps = [...stepSet].sort((a, b) => a - b);
+            const lastStep = steps[steps.length - 1] || 0;
+            candidates.push({
+                enabledMask, values, steps, keepCount: stepSet.size, lastStep,
+                cutoffLianjin: lastStep ? xlAfter[lastStep] - initialXl : 0,
+            });
+        }
+        if (!candidates.length) return { total: 0, values: initialValues.slice(), steps: [], cutoffLianjin: 0 };
+        candidates.sort((a, b) => {
+            const totalA = sumValues(a.values);
+            const totalB = sumValues(b.values);
+            if (Math.abs(totalA - totalB) > 1e-12) return totalB - totalA;
+            return compareMeta(a, b);
+        });
+        const maxTotal = sumValues(candidates[0].values);
+
+        function linkedSteps(node) {
+            const out = [];
+            while (node) {
+                out.push(node.step);
+                node = node.prev;
+            }
+            return out.reverse();
         }
 
-        const total = [1, 2, 3].reduce((sum, slot) => sum + (maxima[slot] ? maxima[slot].value : 0), 0);
-        if (!accepted.length) return { prop: targetProp, maxima, total, plan: null, previewCount: count };
+        function minimizeTargetPath(targetValues, enabledMask) {
+            let achieved = 0;
+            for (let slot = 0; slot < slotCount; slot += 1) {
+                if (initialValues[slot] >= targetValues[slot] - 1e-12) achieved |= 1 << slot;
+            }
+            if (achieved === allMask) {
+                return { enabledMask, values: targetValues, steps: [], keepCount: 0, lastStep: 0, cutoffLianjin: 0 };
+            }
+            const keyOf = (mask, xl, ach) => `${mask}|${Math.min(100, xl)}|${ach}`;
+            let states = new Map();
+            states.set(keyOf(initialMask, initialXl, achieved), {
+                mask: initialMask, xlLevel: initialXl, achieved, keepCount: 0, path: null,
+            });
+            let best = null;
+            const addState = (bucket, state) => {
+                const key = keyOf(state.mask, state.xlLevel, state.achieved);
+                const old = bucket.get(key);
+                if (!old || state.xlLevel < old.xlLevel
+                    || (state.xlLevel === old.xlLevel && state.keepCount < old.keepCount)) bucket.set(key, state);
+            };
+            for (let step = 1; step <= count && states.size; step += 1) {
+                const next = new Map();
+                for (const state of states.values()) {
+                    const offer = offerAt(step, state.xlLevel);
+                    const nextXl = state.xlLevel + xilianMaskMult(state.mask);
+                    addState(next, { ...state, xlLevel: nextXl });
+                    const slotIndex = Number(offer && offer.slot) - 1;
+                    if (slotIndex < 0 || slotIndex >= slotCount || !(enabledMask & (1 << slotIndex))) continue;
+                    const bit = 1 << slotIndex;
+                    const unmarked = !(state.mask & bit);
+                    const reachesTarget = slotTargetValue(offer && offer.prop, targetProp) >= targetValues[slotIndex] - 1e-12;
+                    if (!unmarked && (!reachesTarget || (state.achieved & bit))) continue;
+                    let nextAchieved = state.achieved;
+                    if (reachesTarget) nextAchieved |= bit;
+                    else if (unmarked) nextAchieved &= ~bit;
+                    const accepted = {
+                        mask: state.mask | bit, xlLevel: nextXl, achieved: nextAchieved,
+                        keepCount: state.keepCount + 1, path: { step, prev: state.path },
+                    };
+                    if (accepted.achieved === allMask) {
+                        const done = {
+                            enabledMask, values: targetValues, steps: linkedSteps(accepted.path),
+                            keepCount: accepted.keepCount, lastStep: step, cutoffLianjin: nextXl - initialXl,
+                        };
+                        if (!best || compareMeta(done, best) < 0) best = done;
+                    } else addState(next, accepted);
+                }
+                states = next;
+            }
+            return best;
+        }
+
+        const topCandidates = candidates.filter(item => Math.abs(sumValues(item.values) - maxTotal) <= 1e-12);
+        let best = null;
+        for (const candidate of topCandidates) {
+            const minimized = minimizeTargetPath(candidate.values, candidate.enabledMask) || candidate;
+            if (!best || compareMeta(minimized, best) < 0) best = minimized;
+        }
+        return { total: maxTotal, values: best.values.slice(), steps: best.steps.slice(), cutoffLianjin: best.cutoffLianjin };
+    }
+
+    function analyzeRefinement(bridge, equip, targetProp, count, data, preparedContext) {
+        const context = preparedContext || buildRefinementContext(bridge, equip, count);
+        const plan = computeExactRefinementPlan(context, targetProp);
+        const accepts = Array(context.count).fill(false);
+        plan.steps.forEach(step => {
+            if (step >= 1 && step <= context.count) accepts[step - 1] = true;
+        });
+
+        let replayItems = [];
+        if (accepts.some(Boolean)) {
+            const replay = bridge.xilianPlan(toWasmEquip(equip), accepts);
+            if (replay && replay.error && !(replay.items || []).length) throw new Error(replay.error);
+            replayItems = (replay && replay.items || []).slice(0, context.count);
+        }
+
+        const maxima = { 1: null, 2: null, 3: null };
+        for (let slot = 1; slot <= context.slotCount; slot += 1) {
+            const value = plan.values[slot - 1];
+            if (!(value > 0)) continue;
+            const slotAccepts = replayItems.filter(item => item.accepted
+                && Number(item.slot) === slot && slotTargetValue(item.prop, targetProp) > 0);
+            const occurrence = slotAccepts.length
+                ? { index: Number(slotAccepts[slotAccepts.length - 1].index), slot, value }
+                : { index: 0, slot, value, source: 'original' };
+            maxima[slot] = { slot, value, occurrences: [occurrence] };
+        }
+
+        const accepted = [];
+        for (const item of replayItems) {
+            if (!item.accepted) continue;
+            accepted.push({
+                index: Number(item.index),
+                slot: Number(item.slot),
+                value: Number(item.prop && (item.prop.value != null ? item.prop.value : item.prop.Value)) || 0,
+                prop: item.prop && (item.prop.prop || item.prop.Key || item.prop.key),
+            });
+        }
+
+        const total = plan.total;
+        if (!accepted.length) return { prop: targetProp, maxima, total, plan: null, previewCount: context.count };
         const cutoff = accepted[accepted.length - 1].index;
-        const cost = refinementCost(equip, plannedItems, cutoff, data);
+        const cost = refinementCost(equip, replayItems, cutoff, data);
         return {
             prop: targetProp,
             maxima,
             total,
-            plan: {
-                accepts: accepted,
-                accepted,
-                cutoff,
-                cost,
-            },
-            previewCount: count,
+            plan: { accepts: accepted, accepted, cutoff, cost },
+            previewCount: context.count,
         };
     }
 
@@ -631,7 +725,8 @@
         const data = requireData(input && input.data);
         const bridge = input && input.bridge;
         if (!bridge || typeof bridge.getMakeState !== 'function' || typeof bridge.setMakeState !== 'function'
-            || typeof bridge.makePreview !== 'function' || typeof bridge.xilianPlan !== 'function') {
+            || typeof bridge.makePreview !== 'function' || typeof bridge.xilianPlan !== 'function'
+            || typeof bridge.xilianOnce !== 'function') {
             throw new TypeError('装备模拟桥接接口不完整');
         }
         const options = normalizeOptions(input.options);
@@ -746,8 +841,10 @@
                     phase: 'refine', done: candidateIndex, total: candidates.length,
                     message: `分析${Number(source.item.color) === 3 ? '蓝装' : '紫装'} ${candidateIndex + 1}/${candidates.length}：${source.branchResult.equipName} · 第 ${source.item.index} 次`,
                 });
+                // 精确最高计算：按件复用同一精炼序列上下文，逐目标属性精确搜索
+                const refineContext = buildRefinementContext(bridge, equip, options.refineCount);
                 const refinements = source.branchResult.targetProps.map(prop => analyzeRefinement(
-                    bridge, equip, prop, options.refineCount, data,
+                    bridge, equip, prop, options.refineCount, data, refineContext,
                 ));
                 const refinementRatingReference = theoreticalRefinementReference(
                     data.equipment[String(equip.id)],
@@ -843,9 +940,8 @@
         makeResultToEquip,
         canUpgrade,
         upgradeEquip,
-        collectSlotMaxima,
-        initialSlotMaxima,
-        selectCheapestMaxima,
+        buildRefinementContext,
+        computeExactRefinementPlan,
         analyzeRefinement,
         specialMaterialValueRange,
         predictSpecialAttachSequence,
