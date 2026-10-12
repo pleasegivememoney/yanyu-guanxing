@@ -3095,6 +3095,12 @@ function aiProgressPercent(progress) {
         const ceiling = Math.max(1, Number(progress.activePillCeiling || progress.maxTotalPills || 1));
         return Math.max(3, Math.min(96, Math.round(Number(progress.currentPillCost || 0) / ceiling * 96)));
     }
+    if (progress.phase === 'optimal-proof') {
+        const best = Number(progress.bestComplete || 0);
+        if (!best) return 40;
+        const gap = Number(progress.gap == null ? best : progress.gap);
+        return Math.max(46, Math.min(96, 96 - Math.round(gap / Math.max(1, best) * 40)));
+    }
     return 0;
 }
 
@@ -3118,7 +3124,9 @@ function renderAiSearchProgress(progress) {
         ? '后台线程'
         : (progress?.phase === 'bounded-search'
             ? `当前分支 ${Number(progress.currentPillCost || 0).toLocaleString()} / ${Number(progress.activePillCeiling || progress.maxTotalPills || 0).toLocaleString()} 丹 · 关键事件 ${Number(progress.expandedNodes || 0).toLocaleString()} · 模拟洗脉 ${Number(progress.rawWashesSimulated || 0).toLocaleString()}`
-            : (progress?.phase === 'complete' ? '完成' : '正在初始化'));
+            : (progress?.phase === 'optimal-proof'
+                ? `最优证明 · 已找到 ${progress.bestComplete == null ? '—' : Number(progress.bestComplete).toLocaleString()} 丹 · 下界 ${progress.lowerBound == null ? '—' : Number(progress.lowerBound).toLocaleString()} · 缺口 ≤ ${progress.gap == null ? '—' : Number(progress.gap).toLocaleString()} 丹 · 状态 ${Number(progress.statesExpanded || 0).toLocaleString()}`
+                : (progress?.phase === 'complete' ? '完成' : '正在初始化')));
     if (fill) fill.style.width = `${value}%`;
 }
 
@@ -3227,15 +3235,26 @@ function renderAiPrediction(result) {
         <span class="ai-compare-value">${Number(route.totalPills).toLocaleString()} 丹</span>
     </div>`).join('');
     const scope = result.searchScope || {};
+    const macroProof = scope.stageB && scope.stageB.actionGraph !== 'full';
     container.innerHTML = `<div class="ai-result-summary">
         <span class="ai-route-strength">${escapeAiHtml(result.strength)}</span>
+        ${result.verifiedOptimal
+            ? `<span class="ai-route-strength">最优性：${macroProof ? '已在宏观事件动作图（寻脉段+置换窗口策略族）内证明最低丹耗' : '已在全体合法动作图上证明最低丹耗'}</span>`
+            : (result.gap != null
+                ? `<span class="ai-route-strength">最优性：预算内最优，最低可能 ≥ ${Number(result.lowerBound).toLocaleString()} 丹（缺口 ≤ ${Number(result.gap).toLocaleString()} 丹）</span>`
+                : '')}
         <span>目标：<strong>${escapeAiHtml((result.targetNames || []).join('、'))}</strong></span>
         <span>关键事件 A*：展开 <strong>${Number(scope.expandedNodes || 0).toLocaleString()}</strong> · 模拟洗脉 <strong>${Number(scope.rawWashesSimulated || 0).toLocaleString()}</strong> · 生成事件 <strong>${Number(scope.generatedNodes || 0).toLocaleString()}</strong></span>
         <span>队列峰值 <strong>${Number(scope.frontierPeak || 0).toLocaleString()}</strong> / ${Number(scope.frontierLimit || 0).toLocaleString()} · 权重剪枝 <strong>${Number(scope.prunedByFrontier || 0).toLocaleString()}</strong> · 支配剪枝 <strong>${Number(scope.dominatedNodes || 0).toLocaleString()}</strong></span>
         <span>冲突入口 <strong>${Number(scope.conflictAnchors || 0).toLocaleString()}</strong> · 目标暂时置换 <strong>${Number(scope.targetSacrificeBranches || 0).toLocaleString()}</strong> 个 · 首次置换垫洗 <strong>${Number(scope.firstExchangePadsChecked || 0).toLocaleString()}</strong> 个</span>
         <span>丹耗超限剪枝 <strong>${Number(scope.prunedByPills || 0).toLocaleString()}</strong> 个</span>
-        <span>整条路线 ≤ ${Number(scope.maxTotalPills || 0).toLocaleString()} 丹 · 找到路线后继续搜索更低丹耗分支</span>
+        <span>整条路线 ≤ ${Number(scope.maxTotalPills || 0).toLocaleString()} 丹 · ${result.verifiedOptimal
+            ? (macroProof ? '宏观事件动作图族内已证明最低丹耗' : '已证明为最低丹耗路线')
+            : (result.gap != null
+                ? `最低可能 ≥ ${Number(result.lowerBound).toLocaleString()} 丹，缺口 ≤ ${Number(result.gap).toLocaleString()} 丹`
+                : '找到路线后继续搜索更低丹耗分支')}</span>
         ${scope.initialLuckSeedInited ? '<span>欧气种子已初始化：首次置换垫洗不会改变既有序列</span>' : ''}
+        ${scope.stageB ? `<span>最优证明：展开状态 <strong>${Number(scope.stageB.statesExpanded || 0).toLocaleString()}</strong> · 支配剪枝 <strong>${Number(scope.stageB.dominatedNodes || 0).toLocaleString()}</strong> · 上界剪枝 <strong>${Number(scope.stageB.prunedByUpperBound || 0).toLocaleString()}</strong> · 置换边 <strong>${Number(scope.stageB.exchangeEdgesGenerated || 0).toLocaleString()}</strong> · 终止 <strong>${escapeAiHtml(scope.stageB.terminatedBy || 'running')}</strong></span>` : ''}
         <span>结论仅覆盖：${escapeAiHtml(scope.strategyGraph || '固定四槽战术动作图')}</span>
     </div>
     <div class="ai-route-comparison" role="img" aria-label="前三条路线总丹耗对比">
@@ -3248,22 +3267,43 @@ function renderAiPrediction(result) {
             const index = Number(button.dataset.routeIndex);
             const route = result.routes[index];
             const markdown = formatAiRouteMarkdown(result, route, index + 1);
-            try {
-                if (navigator.clipboard?.writeText) {
-                    await navigator.clipboard.writeText(markdown);
-                } else {
-                    const textarea = document.createElement('textarea');
-                    textarea.value = markdown;
-                    textarea.style.position = 'fixed';
-                    textarea.style.opacity = '0';
-                    document.body.appendChild(textarea);
-                    textarea.select();
-                    document.execCommand('copy');
-                    textarea.remove();
+            // file:// 下的 iframe 里 navigator.clipboard 往往存在，但 writeText 会因
+            // 非安全上下文 / 文档未聚焦而 reject，故失败时须回退到 execCommand，
+            // 只有两条路径都失败才提示手动复制。
+            const legacyCopy = () => {
+                const textarea = document.createElement('textarea');
+                textarea.value = markdown;
+                textarea.setAttribute('readonly', '');
+                textarea.style.position = 'fixed';
+                textarea.style.top = '0';
+                textarea.style.left = '0';
+                textarea.style.opacity = '0';
+                document.body.appendChild(textarea);
+                textarea.select();
+                textarea.setSelectionRange(0, markdown.length);
+                let ok = false;
+                try {
+                    ok = document.execCommand('copy');
+                } catch (e) {
+                    ok = false;
                 }
+                textarea.remove();
+                return ok;
+            };
+            let copied = false;
+            if (navigator.clipboard?.writeText) {
+                try {
+                    await navigator.clipboard.writeText(markdown);
+                    copied = true;
+                } catch (e) {
+                    copied = false;
+                }
+            }
+            if (!copied) copied = legacyCopy();
+            if (copied) {
                 button.textContent = '已复制';
                 setTimeout(() => { button.textContent = '复制 Markdown 路线'; }, 1600);
-            } catch (error) {
+            } else {
                 alert('复制失败，请展开详细操作后手动复制。');
             }
         });
@@ -3300,6 +3340,15 @@ async function runAiPrediction() {
 
     pushStateToWasm();
     const initialState = wasmGetState();
+    // wasmGetState() 不回读 born_talent_rc / save_version / save_channel，
+    // 而自动优化器引擎（wash_route_engine.js）依赖这三项复现 born 序列 RNG。
+    // 采用与手动路径（pushStateToWasm / washPredictionStateSnapshot /
+    // buildExchangeSequenceWasmState）完全一致的来源，保证自动与手动同序。
+    if (initialState) {
+        initialState.born_talent_rc = Number(state.bornTalentRC) || 0;
+        initialState.save_version = state.saveVersion || '';
+        initialState.save_channel = state.saveChannel || '';
+    }
     try {
         const result = await startAiSearchWorker({
             initialState,

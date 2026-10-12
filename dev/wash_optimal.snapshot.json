@@ -1,0 +1,33 @@
+{
+  "description": "洗脉最优丹耗对拍快照：场景最优值（确定性种子构造，引擎逻辑不变则值稳定）",
+  "generatedAt": "2026-10-09T08:54:45.392Z",
+  "scenarios": [
+    {
+      "label": "单目标空槽首洗",
+      "bestPills": 5,
+      "lowerBound": 5,
+      "gap": 0,
+      "verifiedOptimal": true,
+      "terminatedBy": "optimal-proven",
+      "totalWashes": 1
+    },
+    {
+      "label": "三目标已含二锁二首洗",
+      "bestPills": 8,
+      "lowerBound": 8,
+      "gap": 0,
+      "verifiedOptimal": true,
+      "terminatedBy": "optimal-proven",
+      "totalWashes": 1
+    },
+    {
+      "label": "四目标已含三锁三首洗",
+      "bestPills": 10,
+      "lowerBound": 10,
+      "gap": 0,
+      "verifiedOptimal": true,
+      "terminatedBy": "optimal-proven",
+      "totalWashes": 1
+    }
+  ]
+}
