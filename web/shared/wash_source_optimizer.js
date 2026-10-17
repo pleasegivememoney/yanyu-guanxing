@@ -758,38 +758,87 @@
         const slots = phase1.slots;
 
         // --- 阶段 1：推进到固化点 ---
+        let fixations = null;
         if (candidate.method === 'exchangeChain') {
             // 非首紫跳脉：需要找到锁模式使 cumDraws = targetN 且 exchange 可触发
             const fixResult = findExchangeFixation(engine, startState, targetN, targetIds, targetSet, maxPills, phase1);
             if (!fixResult) return null;
-            state = fixResult.state;
-            cost = fixResult.cost;
-            locked = fixResult.locked;
-            actions.push(...fixResult.actions);
+            fixations = [fixResult, ...(fixResult.alts || [])].slice(0, 6);
         } else {
             // 首紫跳脉：重放到 pity 触发点
             const pityResult = replayToPity(engine, startState, candidate, phase1, maxPills);
             if (!pityResult) return null;
-            state = pityResult.state;
-            cost = pityResult.cost;
-            locked = pityResult.locked;
-            actions.push(...pityResult.actions);
+            fixations = [pityResult];
         }
 
-        // 确认 luckSeed 已固化
-        if (state.luckSeed == null) return null;
+        // 对每个固化候选完成「升四槽 + 贪心补齐」，按真实总成本（固化+贪心）择优。
+        // 基线 chosen 恒在候选列表首位⇒其总成本为上界，只有严格更低者才替换⇒绝不使既有基线回归。
+        let bestRoute = null;
+        const seedSeen = new Set();
+        for (const fixResult of fixations) {
+            if (!fixResult) continue;
+            if (fixations.length > 1) {
+                const sd = fixResult.state.luckSeed;
+                if (sd != null) { if (seedSeen.has(sd)) continue; seedSeen.add(sd); }
+            }
+            // 确认 luckSeed 已固化
+            if (fixResult.state.luckSeed == null) continue;
+            let state = fixResult.state;
+            let cost = fixResult.cost;
+            let locked = fixResult.locked;
+            const actions = [...fixResult.actions];
 
-        // --- 阶段 2：升四槽（如果当前三槽且目标需要）---
-        if (state.zizhi < 154 && targetIds.length >= 2) {
-            const up = actionUpgrade(engine, state, 4);
-            actions.push(up.action);
-            state = up.state;
+            // --- 阶段 2：升四槽（如果当前三槽且目标需要）---
+            if (state.zizhi < 154 && targetIds.length >= 2) {
+                const up = actionUpgrade(engine, state, 4);
+                actions.push(up.action);
+                state = up.state;
+            }
+
+            // --- 阶段 3：固化后贪心重放（两种取径择优：自然优先 / 置换优先，取更省丹者）---
+            const runGreedy = preferExchange => {
+                const acts = [];
+                const r = greedyPostFixation(engine, state, locked, targetIds, targetSet, maxPills - cost, acts, phase1, preferExchange);
+                return r ? { r, acts } : null;
+            };
+            const naturalRun = runGreedy(false);
+            const exchangeRun = runGreedy(true);
+            let chosen = null;
+            if (naturalRun && exchangeRun) chosen = naturalRun.r.cost <= exchangeRun.r.cost ? naturalRun : exchangeRun;
+            else chosen = naturalRun || exchangeRun;
+            if (!chosen) continue;
+            const total = cost + chosen.r.cost;
+            if (!bestRoute || total < bestRoute.cost) bestRoute = { state: chosen.r.state, cost: total, actions: [...actions, ...chosen.acts] };
         }
+        return bestRoute;
+    }
 
-        // --- 阶段 3：固化后贪心重放 ---
-        const postResult = greedyPostFixation(engine, state, locked, targetIds, targetSet, maxPills - cost, actions, phase1);
-        if (!postResult) return null;
-        return { state: postResult.state, cost: cost + postResult.cost, actions };
+    // 在「前置锁真实垫洗流」中发现工具蓝的出现洗（作为锁定起点候选）。
+    // 关键：findExchangeFixation 的 lockWash 候选取自 0 锁自然轨迹，但一旦带前置锁（如九阴鬼脉），
+    // 槽位内容随之改变⇒工具蓝在真实垫洗流里的出现洗完全不同，用轨迹 lockWash 会让 simulateToExchange
+    // 命中「工具蓝不在槽位」而 return null，只剩偶发对齐的过早窗口⇒过早锁工具蓝⇒长段慢洗⇒垫洗成本虚高。
+    // 本函数用与 simulateToExchange 完全一致的前置锁演进（锁=出现在槽内的前置目标；按 heldLocks+1>槽数 升 4 槽；
+    // keepIds 截到 槽数-1），逐洗推进并记录「工具蓝在槽内」的洗号⇒这些才是合法的锁定起点。取靠后者（runway 小、
+    // 慢洗段短）即参考路线的「晚锁工具蓝」模式。
+    function preFixLockOnsets(engine, startState, preFixIds, toolId, slots, capWash, capCum) {
+        const clone = root.WashSourceEngine.cloneState;
+        const preSet = new Set(preFixIds || []);
+        const slotOf = (st) => (engine.slotCountFor ? engine.slotCountFor(st.zizhi) : (numeric(st.zizhi, 154) - 150));
+        let state = clone(startState);
+        let cum = 0;
+        const onsets = [];
+        for (let w = 1; w <= capWash; w++) {
+            if (state.talents.includes(toolId)) onsets.push(w);
+            const lockedPre = state.talents.filter(id => preSet.has(id));
+            let sc = slotOf(state);
+            if (lockedPre.length + 1 > sc && sc < 4) { state = actionUpgrade(engine, state, 4).state; sc = slotOf(state); }
+            const keepIds = idsInStateOrder(state, lockedPre).slice(0, Math.max(0, sc - 1));
+            const washed = engine.wash(state, positionsForIds(state, keepIds));
+            cum += washed.draws;
+            state = washed.state;
+            if (capCum && cum > capCum) break;
+        }
+        return onsets;
     }
 
     function findExchangeFixation(engine, startState, targetN, targetIds, targetSet, maxPills, phase1) {
@@ -840,69 +889,179 @@
         ranked.sort((a, b) => b.appearances.length - a.appearances.length || b.bestRunway - a.bestRunway);
         const toSearch = ranked.slice(0, 6);
 
-        // 遍历所有 (工具蓝, 出现洗) 组合：返回「精确命中 targetN 且固化成本最低」者。
+        // 前置自然锁候选：在固化点 targetN 之前（born 链 cumDraws < targetN）自然出现的目标。
+        // 「某目标走固化前置持有」与「走固化/后置置换获得」是搜索分支——须都试，故枚举变体：
+        // 空集（旧行为，保证 3 目标基线不回归）+ 每个候选单独前置。4 槽预算下最多同时 1 条前置锁。
+        const effSlotsForBudget = targetIds.length >= 2 ? 4 : slots;
+        const maxHolds = Math.max(0, effSlotsForBudget - 3);
+        const naturalBeforePool = targetIds.filter(t => {
+            const ws = phase1.allAppearances && phase1.allAppearances.get(t);
+            if (!ws || !cumDrawsTrajectory) return false;
+            return ws.some(x => { const c = cumDrawsTrajectory[x]; return c > 0 && c < targetN; });
+        }).sort((a, b) => {
+            const fa = (phase1.allAppearances.get(a) || [])[0] ?? Infinity;
+            const fb = (phase1.allAppearances.get(b) || [])[0] ?? Infinity;
+            return fa - fb;
+        });
+        const preFixVariants = [[]];
+        if (maxHolds >= 1) for (const t of naturalBeforePool.slice(0, 3)) preFixVariants.push([t]);
+
+        // 遍历所有 (工具蓝, 出现洗, 前置锁变体) 组合：返回「精确命中 targetN 且固化成本最低」者。
         // 不可在首个精确命中处 return——不同 lockWash 命中同一 N 的成本可差 ~11 丹（聂风 641 vs 652）。
+        // 选择准则：先比「固化后仍持有的目标数」降序，再比成本升序。
+        // 原因：被固化丢弃、且 born 位早于 N 无法自然复现、又不在置换序列的目标 ⇒ 后置贪心永远拿不到，
+        // 整条路线不可完成。保留更多目标优先于压低固化成本（否则 4 目标 九阴鬼脉 会被换掉导致 greedy 失败）。
+        const heldCount = (r) => targetIds.filter(id => r.state.talents.includes(id)).length;
+        const exactBetter = (a, b) => heldCount(a) !== heldCount(b) ? heldCount(a) > heldCount(b) : a.cost < b.cost;
         let bestExact = null;
         let bestNear = null;
         let bestDiff = Infinity;
+        let bestNearHeld = -1;
+        let bestHold = null;   // 前置锁固化：luckSeed 自定，cumDraws 不必等于 targetN
         for (const tool of toSearch) {
             const type = engine.talentType(tool.id);
             for (const { aw } of tool.appearances) {
                 const lockWash = aw + 1;
-                const result = simulateToExchange(engine, startState, lockWash, tool.id, type, targetN, maxPills, targetIds, slots, cumDrawsTrajectory);
-                if (!result) continue;
-                if (result.cumDraws === targetN) {
-                    if (!bestExact || result.cost < bestExact.cost) bestExact = result;
-                } else {
-                    const diff = Math.abs(result.cumDraws - targetN);
-                    if (diff < bestDiff) { bestDiff = diff; bestNear = result; }
+                for (const variant of preFixVariants) {
+                    const result = simulateToExchange(engine, startState, lockWash, tool.id, type, targetN, maxPills, targetIds, slots, cumDrawsTrajectory, variant, phase1);
+                    if (!result) continue;
+                    if (variant.length > 0) {
+                        // 前置锁路径：结果已是「持目标 + 产出新目标」的有效固化，按 held 降序 / cost 升序取优
+                        if (!bestHold || exactBetter(result, bestHold)) bestHold = result;
+                        continue;
+                    }
+                    if (result.cumDraws === targetN) {
+                        if (!bestExact || exactBetter(result, bestExact)) bestExact = result;
+                    } else {
+                        const diff = Math.abs(result.cumDraws - targetN);
+                        const hc = heldCount(result);
+                        if (hc > bestNearHeld || (hc === bestNearHeld && diff < bestDiff)) {
+                            bestNearHeld = hc; bestDiff = diff; bestNear = result;
+                        }
+                    }
                 }
             }
         }
-        return bestExact || bestNear;
+        // --- holdMode「晚锁起点」候选（仅作下游备选，绝不改动上面 chosen/bestHold 的基线选择）---
+        // 起点取自「前置锁真实垫洗流」而非 0 锁轨迹：晚锁工具蓝⇒慢洗段短⇒固化成本低。
+        // 这些候选连同基线 chosen 一并返回给 replayWithLuckSeed，由「真实总成本(固化+贪心)」择优，
+        // 基线总成本恒为上界（严格更低才替换）⇒ 2013/4408 不可能回归，Set B 有机会逼近参考 4326。
+        // 起点/窗口不依赖 targetN ⇒ 整轮搜索只算一次并缓存在 phase1 上，避免每个候选 N 重复上百次 oracle 重放拖垮预算。
+        const holdAlts = [];
+        if (!phase1.__holdAlts) {
+            const catalystCumFor = (type) => {
+                let best = Infinity;
+                for (const t of targetIds) {
+                    if (engine.talentType(t) !== type || engine.quality(t) !== 4) continue;
+                    const ws = phase1.allAppearances && phase1.allAppearances.get(t);
+                    if (!ws || !cumDrawsTrajectory) continue;
+                    for (const a of ws) { const c = cumDrawsTrajectory[a]; if (c > 0 && c < best) best = c; }
+                }
+                return best;
+            };
+            const seenSeed = new Set();
+            for (const tool of toSearch) {
+                const type = engine.talentType(tool.id);
+                const catRef = catalystCumFor(type);
+                if (!Number.isFinite(catRef)) continue; // 催化剂目标须能在自然流出现（否则晚锁无从触发）
+                for (const variant of preFixVariants) {
+                    if (variant.length === 0) continue;
+                    const onsets = preFixLockOnsets(engine, startState, variant, tool.id, slots, 600, catRef + 40);
+                    const bandOnsets = onsets.filter(w => {
+                        const c = cumDrawsTrajectory[Math.min(w - 1, cumDrawsTrajectory.length - 1)];
+                        return c >= catRef - 320 && c <= catRef - 4;
+                    });
+                    const picked = (bandOnsets.length ? bandOnsets : onsets).slice(-3);
+                    for (const lockWash of picked) {
+                        const result = simulateToExchange(engine, startState, lockWash, tool.id, type, targetN, maxPills, targetIds, slots, cumDrawsTrajectory, variant, phase1);
+                        if (!result) continue;
+                        const seed = result.state.luckSeed;
+                        if (seed == null || seenSeed.has(seed)) continue;
+                        seenSeed.add(seed);
+                        holdAlts.push(result);
+                    }
+                }
+            }
+            phase1.__holdAlts = holdAlts;
+        } else {
+            holdAlts.push(...phase1.__holdAlts);
+        }
+        // 前置锁固化保留更多目标 ⇒ 优先（这是 4 目标路线九阴鬼脉得以穿过固化的唯一途径）
+        const chosen = (bestHold && heldCount(bestHold) > (bestExact ? heldCount(bestExact) : 0)) ? bestHold
+            : (bestExact || bestHold || bestNear);
+        if (chosen) chosen.alts = holdAlts;
+        return chosen;
     }
 
-    function simulateToExchange(engine, startState, lockWash, toolId, toolType, targetN, maxPills, targetIds, slots, cumDrawsTrajectory) {
+    function simulateToExchange(engine, startState, lockWash, toolId, toolType, targetN, maxPills, targetIds, slots, cumDrawsTrajectory, preFixNaturalIds, phase1) {
         const clone = root.WashSourceEngine.cloneState;
         let state = clone(startState);
         let cost = 0, cumDraws = 0;
         const actions = [];
-        let locked = [];
-        // 动态 maxW：根据剩余 draws 需求和 1-lock/2-lock 阶段的 draws/wash 估算
+        const preFixSet = new Set(preFixNaturalIds || []);
+        const targetSet = new Set(targetIds);
+        let fallback = null;   // holdMode：贪心不可完成时的「宽松可达」回退窗口
+        let bestFinish = null;      // holdMode：种子漂移但贪心可完成、且「固化成本+贪心成本」最小的窗口
+        let bestFinishTotal = Infinity;
+        const holdMode = preFixSet.size > 0;
+        const slotCountOf = (st) => (engine.slotCountFor ? engine.slotCountFor(st.zizhi) : (numeric(st.zizhi, 154) - 150));
+        // 自然位是否仍在固化点之后（born 链锁不变，用 0 锁轨迹的 cumDraws 判定）
+        const _traj = (phase1 && phase1.cumDrawsTrajectory) || cumDrawsTrajectory || [];
+        const _appears = (phase1 && phase1.allAppearances) || null;
+        const naturalAheadCum = (t, fromCum) => {
+            if (!_appears) return null;
+            const ws = _appears.get(t); if (!ws) return null;
+            let best = null;
+            for (const w of ws) { const c = w < _traj.length ? _traj[w] : Infinity; if (c >= fromCum && (best == null || c < best)) best = c; }
+            return best;
+        };
+        let locked = [];       // 持久保护的锁定脉（前置自然目标 + 工具蓝 + 催化剂紫）
+        let blueLocked = false;
+        let catPurpleId = null;
+
+        // 预算与终止上限（同旧逻辑，锁感知放宽窗口）
         const cumAtLock = cumDrawsTrajectory ? cumDrawsTrajectory[Math.min(lockWash - 1, cumDrawsTrajectory.length - 1)] : (lockWash - 1) * slots;
         const remainingDraws = Math.max(0, targetN - cumAtLock);
-        const drawsPerWash = Math.max(1, slots - 2); // 保守：2-lock 阶段 draws/wash
-        const maxW = Math.min(lockWash + Math.max(80, Math.ceil(remainingDraws / drawsPerWash) + 40), 600);
+        const drawsPerWash = Math.max(1, slots - 2);
+        const maxW = Math.min(lockWash + Math.max(120, Math.ceil(remainingDraws / drawsPerWash) + 60), 600);
 
         for (let w = 1; w <= maxW; w++) {
             if (cost > maxPills) return null;
-            let keepIds = [];
 
-            // 在 lockWash 时锁定工具蓝（必须当前槽位中存在）
-            if (w === lockWash && state.talents.includes(toolId)) {
-                locked = [toolId];
-            }
-            // 如果工具蓝不在槽位，无法锁定 → 失败
+            // 到锁定洗：工具蓝必须已在槽位，否则该 lockWash 不可行
             if (w === lockWash && !state.talents.includes(toolId)) return null;
+            if (w >= lockWash && !blueLocked && state.talents.includes(toolId)) {
+                locked.push(toolId); blueLocked = true;
+            }
 
-            if (locked.length) {
-                keepIds = locked.filter(id => state.talents.includes(id));
-                // 工具蓝已锁后，寻找同型紫（type === toolType 的紫脉）出现在槽位中
-                if (keepIds.length === 1 && keepIds[0] === toolId) {
-                    for (const id of state.talents) {
-                        if (id === toolId) continue;
-                        if (engine.quality(id) !== 4) continue;
-                        if (engine.isShenmai(id)) continue;
-                        if (engine.talentType(id) !== toolType) continue;
-                        if (keepIds.length < slots - 1) {
-                            keepIds.push(id);
-                            locked.push(id);
-                        }
-                        break;
-                    }
+            // 固化前自然目标：一旦出现在槽位即锁定持有（穿过固化置换）
+            for (const t of preFixSet) {
+                if (!locked.includes(t) && state.talents.includes(t)) locked.push(t);
+            }
+
+            // 催化剂紫：工具蓝锁定后，其同型普通紫首次出现即锁定（置换时作为牺牲位）
+            if (blueLocked && catPurpleId == null) {
+                for (const id of state.talents) {
+                    if (id === toolId) continue;
+                    if (engine.quality(id) !== 4 || engine.isShenmai(id)) continue;
+                    if (engine.talentType(id) !== toolType) continue;
+                    if (preFixSet.has(id)) continue; // 目标紫不可充当催化剂牺牲
+                    catPurpleId = id; locked.push(id);
+                    break;
                 }
             }
 
+            // 需同时保护的锁数 > 当前槽位-1 时，先升 4 槽（留 ≥1 空槽可洗）
+            let heldLocks = locked.filter(id => state.talents.includes(id)).length;
+            if (heldLocks + 1 > slotCountOf(state) && slotCountOf(state) < 4) {
+                const up = actionUpgrade(engine, state, 4);
+                actions.push(up.action);
+                state = up.state;
+                heldLocks = locked.filter(id => state.talents.includes(id)).length;
+                if (heldLocks + 1 > slotCountOf(state)) return null; // 超出 4 槽容量
+            }
+
+            const keepIds = idsInStateOrder(state, locked).slice(0, Math.max(0, slotCountOf(state) - 1));
             const positions = positionsForIds(state, keepIds);
             const washed = engine.wash(state, positions);
             cumDraws += washed.draws;
@@ -910,33 +1069,94 @@
             state = washed.state;
             actions.push({ kind: 'wash', mode: 'luckseed-fixation', keepIds: washed.keepIds, cost: washed.cost, draws: washed.draws, generatedBars: washed.generatedBars, after: state });
 
-            // 检查 exchange 是否可触发（需要 2 锁：工具蓝 + 同型紫）
-            // 关键：必须等到 cumDraws == targetN 才执行 exchange，因为 luckSeed = bornSeed@cumDraws
-            // 提前 exchange 会导致 luckSeed 偏移，置换序列完全不同
-            if (locked.length >= 2) {
-                const activeLocks = locked.filter(id => state.talents.includes(id));
+            // 工具蓝 + 催化剂紫均在槽位且催化剂位可置换 ⇒ 存在置换窗口。
+            if (blueLocked && catPurpleId != null
+                && state.talents.includes(toolId) && state.talents.includes(catPurpleId)) {
+                const activeLocks = idsInStateOrder(state, locked);
+                const purplePos = state.talents.indexOf(catPurpleId);
                 const replaceable = engine.replaceablePositions(state, activeLocks);
-                if (replaceable.length > 0) {
-                    if (cumDraws === targetN) {
-                        // 精确命中：执行 exchange
-                        const exResult = engine.replace(state, replaceable[0], activeLocks);
+                if (replaceable.includes(purplePos)) {
+                    if (holdMode) {
+                        // 前置锁改变了 draws 粒度 ⇒ 固化的 luckSeed 不再等于任何预枚举 targetN。
+                        // 改为「垫洗扫描置换窗口」：逐洗 peek replace 结果，仅当 (a) 产出尚未持有的目标
+                        // 且 (b) 固化后所有剩余目标仍可达（在置换序列内 OR 自然位在固化点之后）才提交固化。
+                        // (b) 是关键——避免抢在最早出现的目标上固化，锁死一个使其它目标不可达的 luckSeed。
+                        // （engine.replace 是纯函数，peek 不改变 state/luckSeed）。
+                        const peek = engine.replace(state, purplePos, activeLocks);
+                        // addedId 须是目标：新目标，或「自置换」——催化剂本身即目标、置换后仍产出该目标
+                        // （如 天人合一 作催化剂，固化 luckSeed 后仍保留 天人合一）。后者是仅靠催化剂同型
+                        // 目标固化锁 luckSeed 的唯一途径，不能因「已持有」而拒绝提交。
+                        if (targetIds.includes(peek.addedId)) {
+                            const firedHeld = targetIds.filter(id => peek.state.talents.includes(id));
+                            const remain = targetIds.filter(id => !peek.state.talents.includes(id));
+                            let pluck = peek.state.luckSeed; const pset = new Set();
+                            for (let k = 0; k < 30; k++) { const d = engine.draw(pluck, true); pset.add(d[0]); pluck = d[1]; }
+                            const allReach = remain.every(t => pset.has(t) || naturalAheadCum(t, cumDraws) != null);
+                            // firedHeld 须至少保留全部前置自然锁 + 本次产出目标（否则九阴鬼脉等被洗掉）
+                            if (allReach && firedHeld.length >= preFixSet.size + 1) {
+                                const nl = activeLocks.filter(id => id !== peek.removedId && id !== catPurpleId);
+                                if (!nl.includes(peek.addedId)) nl.push(peek.addedId);
+                                // 用贪心作为「跑道 oracle」——仅当固化后贪心能真正补齐全部剩余目标时才提交此窗口。
+                                // 否则过早提交到「纸面可达、实际 wash 预算够不着」的落点（如 cum865 处 天人合一
+                                // 自然位在 2846，需 ~990 洗，超 700 上限），会错过真正可行的更晚落点。
+                                // 固化点可行性对 (luckSeed, 槽内脉, 锁集) 确定；同一 targetN 下 工具×出现洗×前置锁变体
+                                // 网格会多次命中相同固化点且 cost 各异，故缓存「最小完成成本」(无解=∞)、比较时再套预算，
+                                // 避免重复重跑失败 greedy（Phase3 运行时膨胀主因）。
+                                const cache = phase1.__oracleCache || (phase1.__oracleCache = new Map());
+                                const ck = `${peek.state.luckSeed}|${peek.state.talents.join(',')}|${nl.slice().sort((a, b) => a - b).join(',')}`;
+                                const budget = maxPills - cost;
+                                // compCost：从该固化点贪心补齐全部剩余目标的最小成本（无解=∞）。缓存数值而非布尔，
+                                // 以便跨漂移窗口比较「固化成本+贪心成本」择低者——关键：不同漂移点对应不同 luckSeed 紫流，
+                                // 有的紫流让 转世金仙/岿然顶天 双双贴近头部（2 置换即成），有的须长等自然位（成本暴增）。
+                                let compCost;
+                                if (cache.has(ck)) {
+                                    compCost = cache.get(ck);
+                                } else {
+                                    compCost = Infinity;
+                                    for (const pref of [true, false]) {
+                                        const g = greedyPostFixation(engine, peek.state, nl.slice(), targetIds, targetSet, maxPills, [], phase1, pref);
+                                        if (g && g.cost < compCost && targetIds.every(id => g.state.talents.includes(id))) compCost = g.cost;
+                                    }
+                                    cache.set(ck, compCost);
+                                }
+                                const finishable = compCost <= budget;
+                                const fixAct = { kind: 'exchange', mode: 'luckseed-fixation', keepIds: activeLocks.slice(), cost: 0, draws: peek.draws, generatedBars: 0, removedId: peek.removedId, addedId: peek.addedId, after: peek.state };
+                                if (finishable) {
+                                    // 种子一致性契约：置换首次触发时 luck 基 = state.bornSeed（此前 luckSeed 为 null），
+                                    // 由 born 链锁不变性，cumDraws===targetN ⇔ 该固化紫流 === Phase2 打分的 candidate.seed 紫流。
+                                    // 命中种子一致的窗口 ⇒ 立即提交（重放的正是 Phase2 估成本的那条流，转世金仙位次最靠前、锁数最少）。
+                                    if (cumDraws === targetN) {
+                                        actions.push(fixAct);
+                                        return { state: peek.state, cost, locked: nl, actions, cumDraws, finishable: true };
+                                    }
+                                    // 种子漂移窗口：按实际总成本（固化+贪心）取全局最低者，而非首个可完成者。
+                                    const total = cost + compCost;
+                                    if (total < bestFinishTotal) {
+                                        bestFinishTotal = total;
+                                        bestFinish = { state: peek.state, cost, locked: nl, actions: actions.concat([fixAct]), cumDraws, finishable: true };
+                                    }
+                                }
+                                if (!fallback) fallback = { state: peek.state, cost, locked: nl, actions: actions.concat([fixAct]), cumDraws, finishable: false };
+                            }
+                        }
+                        // 落点不佳（非目标 / 下游不可达 / 丢锁）⇒ 继续垫洗推进 bornSeed，寻找更优落点
+                    } else if (cumDraws === targetN) {
+                        // 精确命中：luckSeed = bornSeed@targetN，置换序列须与候选 seed 一致
+                        const exResult = engine.replace(state, purplePos, activeLocks);
                         actions.push({ kind: 'exchange', mode: 'luckseed-fixation', keepIds: activeLocks.slice(), cost: 0, draws: exResult.draws, generatedBars: 0, removedId: exResult.removedId, addedId: exResult.addedId, after: exResult.state });
                         state = exResult.state;
-                        locked = locked.filter(id => id !== exResult.removedId);
-                        if (targetIds.includes(exResult.addedId)) locked.push(exResult.addedId);
+                        locked = locked.filter(id => id !== exResult.removedId && id !== catPurpleId);
+                        if (targetIds.includes(exResult.addedId) && !locked.includes(exResult.addedId)) locked.push(exResult.addedId);
                         return { state, cost, locked, actions, cumDraws };
+                    } else if (cumDraws > targetN) {
+                        return null; // 越过目标，无法精确命中
                     }
-                    if (cumDraws > targetN) {
-                        // 超过目标：无法精确命中，失败
-                        return null;
-                    }
-                    // cumDraws < targetN：继续洗脉推进 bornSeed，不执行 exchange
+                    // cumDraws < targetN：继续垫洗推进 bornSeed，保持全部锁定
                 }
             }
-            // 早期终止：lockWash 之后 cumDraws 超过 targetN → 不可能精确命中
-            if (w >= lockWash && cumDraws > targetN) return null;
+            if (!holdMode && w >= lockWash && cumDraws > targetN) return null;
         }
-        return null;
+        return bestFinish || fallback;
     }
 
     function replayToPity(engine, startState, candidate, phase1, maxPills) {
@@ -970,11 +1190,11 @@
     // 前向模拟（仅锁已获得目标，born 链最快推进）预测每种 type 的催化剂出现洗，
     // 取成本最低者；并在「催化剂前最后一次同型工具蓝出现洗」才锁它（最少 2 锁慢洗）。
     // 这正是 2013 聂风路线的本质：exchange1(type170)→九阴鬼脉，exchange2 切到 type180(拳脚高手→拳脚无双)→转世金仙，岿然顶天自然。
-    function greedyPostFixation(engine, state, initialLocked, targetIds, targetSet, budget, actions, phase1) {
+    function greedyPostFixation(engine, state, initialLocked, targetIds, targetSet, budget, actions, phase1, preferExchange) {
         const clone = root.WashSourceEngine.cloneState;
         let current = clone(state);
         let cost = 0;
-        const maxWashes = 400;
+        const maxWashes = 700;
         const slotCount = engine.slotCountFor ? engine.slotCountFor(current.zizhi) : (current.zizhi - 150);
         const isToolBlue = id => engine.quality(id) !== 4 && !engine.isShenmai(id) && engine.hasOrdinaryPurpleSuccessor(id);
         const isOrdPurple = id => engine.quality(id) === 4 && !engine.isShenmai(id);
@@ -999,16 +1219,21 @@
         let pursuitWash = 0;   // 自本次规划起的洗数
         let lastHeldCount = held.length;
 
-        // 前向模拟：仅锁 heldIds（born 链最快推进），为每种 type 记录催化剂首现洗 + 其前最后一次同型工具蓝出现洗
-        function selectBestCatalystTool(startState, heldIds, horizon) {
+        // 前向模拟：仅锁 heldIds（born 链最快推进），为每种 type 记录催化剂首现洗 + 其前最后一次同型工具蓝出现洗。
+        // bannedTypes：已被「锁定目标紫」占据槽序的类型——置换规则以「同型首个脉」为前置，
+        // 若某锁定目标紫（quality4）排在工具蓝之前会遮蔽该类型，使同型催化剂永不可置换。故这些类型的工具蓝不可选。
+        // targetSet：催化剂紫绝不能是目标本身（置换会牺牲催化剂，若催化剂是目标则丢失已到手段位）。
+        function selectBestCatalystTool(startState, heldIds, horizon, bannedTypes, targetSet) {
+            const ban = bannedTypes || new Set();
             let sim = clone(startState);
             let simCost = 0;
             const lastToolWash = new Map(), lastToolId = new Map(), toolSeen = new Map(), cat = new Map();
             const scan = (w) => {
                 for (const id of sim.talents) {
                     const t = engine.talentType(id);
+                    if (ban.has(t)) continue;
                     if (isToolBlue(id)) { lastToolWash.set(t, w); lastToolId.set(t, id); toolSeen.set(t, true); }
-                    else if (isOrdPurple(id) && toolSeen.has(t) && !cat.has(t)) {
+                    else if (isOrdPurple(id) && !targetSet.has(id) && toolSeen.has(t) && !cat.has(t)) {
                         cat.set(t, { type: t, catalystWash: w, lockWash: lastToolWash.get(t), lockId: lastToolId.get(t), cost: simCost });
                     }
                 }
@@ -1029,10 +1254,13 @@
             if (cost >= budget) return null;
             const heldInSlots = held.filter(id => current.talents.includes(id));
 
-            // 1) 催化剂就位 ⇒ 立即置换（推进 purpleSeq 取下一目标）
+            // 1) 催化剂就位 ⇒ 置换推进 purpleSeq 取下一目标。
+            // 关键：绝不置换「已持有的目标紫」——多目标下与锁定工具同型的已持目标也会成为 replaceable，
+            // 盲目取 replaceable[0] 会把九阴鬼脉/天生神力 等已到手目标牺牲掉，导致路线不可完成。
             const activeLocks = lockedTool && current.talents.includes(lockedTool.id)
                 ? idsInStateOrder(current, [...heldInSlots, lockedTool.id]) : heldInSlots.slice();
-            const replaceable = engine.replaceablePositions(current, activeLocks);
+            const replaceableAll = engine.replaceablePositions(current, activeLocks);
+            const replaceable = replaceableAll.filter(pos => !targetSet.has(current.talents[pos]));
             if (replaceable.length > 0 && current.luckSeed != null) {
                 const exResult = engine.replace(current, replaceable[0], activeLocks);
                 actions.push({ kind: 'exchange', mode: 'luckseed-greedy', keepIds: activeLocks.slice(), cost: 0, draws: exResult.draws, generatedBars: 0, removedId: exResult.removedId, addedId: exResult.addedId, after: exResult.state });
@@ -1042,16 +1270,19 @@
                 continue;
             }
 
-            // 2) 剩余目标分类：∈purpleSeq 且非自然 ⇒ 需置换
+            // 2) 剩余目标分类：∈purpleSeq 且（非自然 或 preferExchange）⇒ 需置换；否则守自然。
+            //    natural-priority 保留 3 目标 2013 结构；exchange-priority 走「全员置换」短路自然长途等待。
             const remaining = targetIds.filter(id => !held.includes(id));
-            const needExchange = remaining.filter(id => pset.has(id) && !naturalSet.has(id));
+            const needExchange = remaining.filter(id => pset.has(id) && (preferExchange || !naturalSet.has(id)));
             if (held.length !== lastHeldCount) { plan = null; lockedTool = null; pursuitWash = 0; lastHeldCount = held.length; }
 
             // 3) 规划工具类型 + 在最晚时机锁工具蓝
             let keepIds = heldInSlots.slice();
             if (needExchange.length) {
                 if (!plan) {
-                    const cands = selectBestCatalystTool(current, heldInSlots, 160);
+                    const bannedTypes = new Set();
+                    for (const id of heldInSlots) if (engine.quality(id) === 4) bannedTypes.add(engine.talentType(id));
+                    const cands = selectBestCatalystTool(current, heldInSlots, 160, bannedTypes, targetSet);
                     if (cands.length) { plan = cands[0]; pursuitWash = 0; }
                 }
                 if (plan && !lockedTool && pursuitWash >= plan.lockWash) {
@@ -1102,6 +1333,37 @@
         return opps;
     }
 
+    // 「固化前自然锁」：目标 t 在 born 链上于固化点 N 之前（cumDraws < N）就自然出现，
+    // 可在固化前锁定并持有穿过固化置换——既非固化 exchange 直接产出（pos0），也非固化后自然捕获。
+    // 这是 4 目标聂风路线（九阴鬼脉@74 持有穿过 wash~191 固化）的关键形态。
+    // born 链位置与锁模式无关（cumDraws→脉固定），故「是否在 N 前出现」可用 0 锁轨迹的 cumDrawsTrajectory 判定。
+    // 槽位预算：固化瞬间同时锁 = 前置自然目标 + 工具蓝 + 催化剂紫，洗脉须留 ≥1 空槽
+    // ⇒ 前置自然目标 ≤ slots-3（4 槽时 ≤1；3 槽时为 0，退化为纯固化产出）。
+    function preFixNaturalHolds(engine, phase1, targetIds, pos0, N, slots) {
+        const traj = phase1.cumDrawsTrajectory || [];
+        const appears = phase1.allAppearances || new Map();
+        const maxHolds = Math.max(0, slots - 3);
+        const result = [];
+        for (const t of targetIds) {
+            if (t === pos0) continue;
+            const washes = appears.get(t);
+            if (!washes) continue;
+            let beforeFix = false;
+            for (const w of washes) {
+                const c = w < traj.length ? traj[w] : Infinity;
+                if (c > 0 && c < N) { beforeFix = true; break; }
+            }
+            if (beforeFix) result.push(t);
+        }
+        // 出现越早越值得前置持有（垫洗窗口最长）；超出槽位预算的按出现首洗升序截断。
+        result.sort((a, b) => {
+            const wa = (appears.get(a) || [])[0] ?? Infinity;
+            const wb = (appears.get(b) || [])[0] ?? Infinity;
+            return wa - wb;
+        });
+        return result.slice(0, maxHolds);
+    }
+
     // 估算候选路线总丹耗（仅用于 Phase 3 排序）：固化成本 + 固化后「各次置换等催化剂 + 自然目标等 born 位置」的垫洗成本。
     // 三个关键项，缺一即会把实际失败/昂贵的候选误排到最前、耗尽 Phase 3 预算：
     //  (1) 固化后每次 exchange 必须等 born 链推进到下一个可用催化剂位置（主导成本）；
@@ -1113,7 +1375,9 @@
         const traj = phase1.cumDrawsTrajectory || [];
         const base = phase1.baseCost || 3;
         const base4 = base + 2; // 四槽 baseCost
-        const zizhi = 150 + (phase1.slots || 3);
+        // 多目标路线须升到 4 槽运行（固化前置锁 + 后置置换均按 4 槽），isAllowedAt 按实际槽位判定
+        const effSlots = targetIds.length >= 2 ? 4 : (phase1.slots || 3);
+        const zizhi = 150 + effSlots;
         let fixWash = -1;
         for (let w = 0; w < traj.length; w++) { if (traj[w] >= N) { fixWash = w; break; } }
         if (fixWash < 0) return Infinity; // N 超出自然序列可达范围
@@ -1130,6 +1394,8 @@
         if (fixIdx < 0) fixIdx = 0;
         const pos0 = ps[fixIdx]; // 固化 exchange 实际产出（首个可产出项）
         const fixAllowedCount = allowedPrefix[fixIdx] || 1;
+        // 固化前自然捕获并持有穿过固化的目标：既非 pos0，也非固化后自然位，按「已持有」计（近似免费）
+        const preFixHolds = new Set(preFixNaturalHolds(engine, phase1, targetIds, pos0, N, effSlots));
 
         // 自然目标 born 位置 ≥ N 的最早 cumDraws（否则固化前已丢失）
         const natCumAt = (t) => {
@@ -1147,6 +1413,7 @@
         const exchangeTargets = [];
         for (const t of targetIds) {
             if (t === pos0) continue; // 固化 exchange 直接产出
+            if (preFixHolds.has(t)) continue; // 固化前已自然持有（近似免费）
             const nat = natCumAt(t);
             if (nat != null) continue; // 可自然捕获（更省），稍后计入等待
             const pos = targetPositions && targetPositions.get ? targetPositions.get(t) : undefined;
@@ -1170,15 +1437,17 @@
         }
         // 自然目标：等到其 born 位置（cumDraws ≥ N）后捕获
         for (const t of targetIds) {
-            if (t === pos0) continue;
+            if (t === pos0 || preFixHolds.has(t)) continue;
             const nat = natCumAt(t);
             if (nat == null) continue; // 已在 exchangeTargets/missed 处理
             if (nat > curCum) { waitDraws += nat - curCum; curCum = nat; }
         }
         // 固化后 2 锁 4 槽：约 3 draws/洗、每洗 base4+3 丹
         const waitCost = Math.ceil(waitDraws / 3) * (base4 + 3);
+        // 锁感知修正：固化前持有前置自然目标使 draws/wash 下降，推进到 N 需更多洗
+        const lockBump = preFixHolds.size > 0 ? Math.ceil(N / Math.max(1, effSlots - 1)) * base : 0;
         const wastePenalty = (pos0 != null && targetIds.includes(pos0)) ? 0 : 300;
-        return fixCost + waitCost + missed + wastePenalty;
+        return fixCost + lockBump + waitCost + missed + wastePenalty;
     }
 
     function analyzeAndScoreLuckSeeds(engine, startState, targetIds, options = {}) {
@@ -1256,8 +1525,12 @@
             if (s.score > 0) scored.push({ ...c, ...s });
         }
         scored.sort((a, b) => b.score - a.score);
-        // 在 topK 截取前过滤不可行候选（N < minFeasibleN 的无法完成 fixation）
-        const feasibleScored = minFeasibleN > 0
+        // 在 topK 截取前过滤不可行候选（N < minFeasibleN 的无法完成 fixation）。
+        // 但该下限假设「固化≈targetN」，仅适用于无需前置锁的路线。4 目标须前置持有自然早到的目标
+        // （如 九阴鬼脉 cum366），固化改走 holdMode ⇒ 实际固化点漂移至 targetN 之后，低 N 候选仍可重建完成
+        // （聂风 N=517 重建至 cum871、贪心补 转世金仙/岿然顶天，5703 丹）。故 4 目标跳过该过滤。
+        const skipFloor = targetIds.length >= 4;
+        const feasibleScored = (minFeasibleN > 0 && !skipFloor)
             ? scored.filter(c => c.method !== 'exchangeChain' || c.totalDraws >= minFeasibleN)
             : scored;
         // 成本感知重排：按估算总丹耗升序（同分则 score 降序），使便宜候选优先进入精算
@@ -1277,7 +1550,8 @@
             if (candidate.estCost === Infinity) continue;
             profilesRun++;
             const route = replayWithLuckSeed(engine, startState, candidate, phase1, targetIds, targetSet, maxTotalPills);
-            if (route && containsTargets(route.state, targetSet)) {
+            const ok = route && containsTargets(route.state, targetSet);
+            if (ok) {
                 if (!bestRoute || route.cost < bestRoute.cost) bestRoute = route;
             }
         }
